@@ -20,9 +20,13 @@ use tracing::instrument;
 use crate::chain::FacilitatorLocalError;
 use crate::facilitator::Facilitator;
 use crate::types::{
-    ErrorResponse, FacilitatorErrorReason, MixedAddress, SettleRequest, VerifyRequest,
-    VerifyResponse,
+    Attestation, ErrorResponse, FacilitatorErrorReason, MixedAddress, SettleRequest,
+    VerifyRequest, VerifyResponse,
 };
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
+use std::str::FromStr;
+use alloy::hex;
 
 /// `GET /verify`: Returns a machine-readable description of the `/verify` endpoint.
 ///
@@ -160,6 +164,59 @@ where
         }
     }
 }
+
+/// `POST /attest`: Compute and return an attestation over a `/verify` result.
+#[instrument(skip_all)]
+pub async fn post_attest_local<A>(
+    State(facilitator): State<A>,
+    Json(body): Json<VerifyRequest>,
+) -> impl IntoResponse
+where
+    A: Facilitator + Clone + Send + Sync + 'static,
+    A::Error: IntoResponse,
+{
+    let node_id = std::env::var("NODE_ID")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown-node".to_string());
+
+    match facilitator.verify(&body).await {
+        Ok(verify_response) => {
+            let mut base = match Attestation::from_verify(node_id, &body, verify_response) {
+                Ok(attestation) => attestation,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: format!("failed to build attestation: {}", err) }),
+                    )
+                        .into_response();
+                }
+            };
+
+            // Try to sign the attestation if an EVM key is available
+            if let Ok(keys) = std::env::var(crate::from_env::ENV_EVM_PRIVATE_KEY) {
+                if let Some(first) = keys.split(',').map(str::trim).find(|s| !s.is_empty()) {
+                    if let Ok(signer) = PrivateKeySigner::from_str(first) {
+                        if let Ok(hash) = Attestation::signing_hash(&body, &base.verify_response) {
+                            match signer.sign_hash(&hash.into()).await {
+                                Ok(sig) => {
+                                    base.signature = Some(format!("0x{}", hex::encode(sig.as_bytes())));
+                                    base.signer = Some(MixedAddress::Evm(signer.address().into()));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(base)).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+// quorum-specific verify handler lives in main.rs to avoid cross-module visibility issues
 
 fn invalid_schema(payer: Option<MixedAddress>) -> VerifyResponse {
     VerifyResponse::invalid(payer, FacilitatorErrorReason::InvalidScheme)

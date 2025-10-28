@@ -8,6 +8,7 @@
 //! and provides serialization logic compatible with external clients.
 
 use alloy::primitives::{Bytes, U256};
+use alloy::primitives::keccak256;
 use alloy::{hex, sol};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as b64;
@@ -1391,6 +1392,38 @@ impl Display for PaymentRequiredResponse {
             self.accepts.len(),
             self.x402_version
         )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attestation {
+    pub node_id: String,
+    pub request_hash: String,
+    pub verify_response: VerifyResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer: Option<MixedAddress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+impl Attestation {
+    pub fn from_verify(node_id: String, request: &VerifyRequest, verify_response: VerifyResponse) -> Result<Self, serde_json::Error> {
+        let request_bytes = serde_json::to_vec(request)?;
+        let hash = keccak256(&request_bytes);
+        let request_hash = format!("0x{}", hex::encode(hash));
+        Ok(Self { node_id, request_hash, verify_response, signer: None, signature: None })
+    }
+
+    pub fn signing_hash(request: &VerifyRequest, verify_response: &VerifyResponse) -> Result<[u8; 32], serde_json::Error> {
+        let req_bytes = serde_json::to_vec(request)?;
+        let vr_bytes = serde_json::to_vec(verify_response)?;
+        let req_hash = keccak256(&req_bytes);
+        let mut message: Vec<u8> = Vec::with_capacity(16 + 32 + vr_bytes.len());
+        message.extend_from_slice(b"x402.attest.v1");
+        message.extend_from_slice(req_hash.as_slice());
+        message.extend_from_slice(&vr_bytes);
+        Ok(keccak256(&message).into())
     }
 }
 
